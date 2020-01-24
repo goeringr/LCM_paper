@@ -1,0 +1,210 @@
+---
+title: "LCM explore"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tximport)
+library(biomaRt)
+library(stringr)
+library(ggfortify)
+library(DESeq2)
+library(pheatmap)
+library(ggpubr)
+library(tidyverse)
+library(cowplot)
+
+```
+
+```{r, tximport stuff}
+
+mart <- useMart("ENSEMBL_MART_ENSEMBL",
+                dataset = "mmusculus_gene_ensembl",
+                host= "www.ensembl.org")
+
+t2g <- getBM(attributes = c("ensembl_transcript_id",
+                            "ensembl_gene_id",
+                            "external_gene_name",
+                            "refseq_mrna"), mart = mart)
+
+t2g <- rename(t2g, target_id = ensembl_transcript_id, 
+              ext_gene = external_gene_name)
+
+ens2gene <- t2g[,c(2,3)]
+colnames(ens2gene)[2] <- "Gene"
+ens2gene <- unique(ens2gene)
+
+
+files <- list.files()
+files <- files %>% grep(pattern = "_filtered.quant.sf",value = TRUE) %>% grep(pattern = "refed", invert = TRUE, value = TRUE)
+samples <- str_sub(files, 1, str_length(files)-18)
+
+salm_dirs <- sapply(samples, function(id) file.path(paste(id,"_filtered.quant.sf",sep = "")))
+tx2gene <- t2g[,c(1,2)]
+colnames(tx2gene) <- c('TXNAME', 'GENEID')
+
+txi <- tximport(salm_dirs, 
+                type = 'salmon', 
+                tx2gene = tx2gene,
+                dropInfReps = TRUE, 
+                countsFromAbundance = 'lengthScaledTPM')
+
+tpms <- data.frame(txi$abundance) 
+tpms <- tpms[apply(tpms, MARGIN = 1, function(x) any(x > 10)), ] 
+
+saveRDS(tpms, file = "LCM_apical_basal_tpms_filtered.txt")
+```
+
+```{r,  tpm plots}
+dat <- t(tpms) %>% 
+  as_tibble() %>% 
+  mutate(sample = colnames(tpms)) %>% 
+  mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal")) %>% 
+  select(sample, region, everything())
+
+
+autoplot(prcomp(log(dat[3:ncol(dat)]+1)), 
+         data = dat,
+         colour = "region") +
+  ggtitle("PCA of log(TPMs)") +
+  theme_cowplot()
+
+```
+
+```{r,  norm count plots}
+conditions <- c("Apical", "Apical", "Apical", "Apical", "Apical", "Basal", "Basal", "Basal", "Basal", "Basal")
+type <- c("paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end")
+colData <- data.frame("sample" = samples, "Conditions" = conditions, "Type" = type)
+
+dds <- DESeqDataSetFromTximport(txi, colData = colData, design = ~Conditions)
+
+dds <- dds[rowMins(counts(dds)) > 10, ]
+
+dds <- DESeq(dds)
+
+norm_counts <- counts(dds,normalized = TRUE)
+norm_counts <- norm_counts[apply(norm_counts, MARGIN = 1, function(x) any(x > 100)), ]
+
+saveRDS(norm_counts, file = "LCM_apical_basal_norm_counts_filtered.txt")
+
+norm_counts_PCAdat <- t(norm_counts) %>%
+  as_tibble() %>%
+  mutate(sample = colnames(norm_counts)) %>%
+  mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal")) %>% 
+  select(region, everything(), -sample)
+
+autoplot(prcomp(log(norm_counts_PCAdat[2:ncol(norm_counts_PCAdat)]+1)),
+         data = norm_counts_PCAdat,
+         colour = "region") +
+  ggtitle("PCA of log(normalized counts)") +
+  theme_cowplot()
+
+
+
+temp <- norm_counts
+annoDF <- colnames(temp) %>% as_tibble() %>%  mutate(region = ifelse(grepl(pattern = "Apical", x = value), "Apical", "Basal")) %>% select(region) %>% as.data.frame()
+rownames(annoDF) <- colnames(temp)
+cor_mat <- temp %>% cor(method = "spearman")
+pheatmap(cor_mat, annotation_col = annoDF)
+
+```
+
+```{r, DE genes heatmap}
+res <- results(dds, contrast = c("Conditions", "Apical", "Basal"))
+rlog <- rlog(dds)
+rlogMatrix <- assay(rlog)
+saveRDS(res, file = "LCM_apical_basal_dds_results_filtered.txt")
+
+sigChanges <- rownames(res)[res$padj < 0.05 & !is.na(res$padj)]
+sigMat <- rlogMatrix[rownames(rlogMatrix) %in% sigChanges,]
+
+#annoDF <- as.data.frame(colData(rlog)[,1,drop=FALSE]) %>%
+#  as_tibble() %>% 
+#  rownames_to_column() %>% 
+#  mutate(sample = str_sub(sample, 1, str_length(sample)-4)) %>%
+#  as.data.frame()
+#rownames(annoDF) <- annoDF$rowname
+#annoDF <- annoDF[2]
+
+#pheatmap(sigMat,
+#         show_rownames = FALSE,
+#         annotation_col = annoDF,
+#         main = "heatmap of log(norm counts)") 
+
+
+```
+
+```{r, DE genes}
+tidyres <- res %>%
+  as_tibble() %>%
+  mutate(ensembl_gene_id = rownames(res)) %>%
+  left_join(t2g[,2:3], by = "ensembl_gene_id") %>%
+  rename("gene" = ext_gene) %>% 
+  unique()
+
+apical_ENSMUSG <- tidyres %>% filter(padj < 0.05, log2FoldChange > 0) %>% select(ensembl_gene_id) %>% as.list()
+basal_ENSMUSG <- tidyres %>% filter(padj < 0.05, log2FoldChange < 0) %>% select(ensembl_gene_id) %>% as.list()
+
+tidyres %>% na.omit() %>% 
+  mutate(Significant = ifelse(padj < 0.05, "p < 0.05", "p > 0.05")) %>% 
+  ggplot(aes(x = log2FoldChange, y = -log2(padj), col = Significant, alpha = Significant)) + 
+  geom_point() +
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1.0, 0.1)) +
+  theme_cowplot()
+
+```
+
+```{r, go analysis}
+#go <- getBM(attributes = c("ensembl_transcript_id",
+#                            "ensembl_gene_id",
+#                            "external_gene_name",
+#                            "go_id",
+#                            "name_1006"), mart = mart)
+#saveRDS(go, file = "mouseGOattributes.txt")
+go <- readRDS(file = "mouseGOattributes.txt")
+
+apical_go <- go %>% as_tibble() %>% filter(ensembl_gene_id %in% apical_ENSMUSG$ensembl_gene_id) %>% group_by(name_1006) %>% summarize(apical = n()) %>% arrange(desc(apical))
+
+basal_go <- go %>% as_tibble() %>% filter(ensembl_gene_id %in% basal_ENSMUSG$ensembl_gene_id) %>% group_by(name_1006) %>% summarize(basal = n()) %>% arrange(desc(basal))
+
+full_join(apical_go, basal_go, by = "name_1006") %>% filter(apical > 5 | basal > 5) %>% mutate(difference = apical - basal) %>% filter(abs(difference) > 5) %>% filter(name_1006 != "") %>% gather(-name_1006, - difference, key = region, value = count) %>% ggplot(aes(x = name_1006, y = count, fill = region)) + geom_bar(stat = "identity", position = "dodge") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+library(enrichR)
+
+ensembl <- useMart("ensembl", dataset="mmusculus_gene_ensembl")
+
+dbs <- listEnrichrDbs()
+dbs <- c("GO_Molecular_Function_2018", "GO_Cellular_Component_2018", "GO_Biological_Process_2018" , "ChEA_2016" ,"KEGG_2019_Human")
+
+apical_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = apical_ENSMUSG,
+      mart = ensembl) %>% pull(., external_gene_name)
+basal_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = basal_ENSMUSG,
+      mart = ensembl) %>% pull(., external_gene_name)
+
+apical_genes <- enrichr(apical_gene_name, dbs)
+basal_genes <- enrichr(basal_gene_name, dbs)
+
+
+apical_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+apical_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+apical_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+basal_genes[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+basal_genes[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+basal_genes[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+```
+
+
+
+
+

@@ -1,0 +1,88 @@
+---
+title: "kmer analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(kmer)
+library(biomaRt)
+library(ggpubr)
+library(tidyverse)
+library(cowplot)
+
+```
+
+```{r,  get UTR seqs}
+#ensmart <- useMart("ensembl", dataset="mmusculus_gene_ensembl")
+#ensemblid <- getBM("ensembl_gene_id", mart=ensmart)
+
+#utr3seq <- getSequence(id = ensemblid, type="ensembl_gene_id", seqType="3utr", mart=ensmart)
+#utr3seq <- utr3seq %>% as_tibble() %>% mutate(length = nchar(`3utr`))
+
+#longest_3utr_Seq <- utr3seq %>% group_by(ensembl_gene_id) %>% summarise(length = max(length))
+#longest_3utr_Seq <- left_join(longest_3utr_Seq, utr3seq)
+
+longest_3utr_Seq <- readRDS(file = "longest_3UTR_seq_biomaRt.txt")
+
+```
+
+```{r, get AB gene lists and seqs}
+apical_gene <- read.table(file = "apical_ENSMUSG.txt", header = FALSE)
+basal_gene <- read.table(file = "basal_ENSMUSG.txt")
+all_gene <- read.table(file = "all_ENSMUSG.txt")
+
+apical_ctrl_gene <- anti_join(all_gene, apical_gene)
+basal_ctrl_gene <- anti_join(all_gene, basal_gene)
+
+apical_seq <- left_join(apical_gene, longest_3utr_Seq, by = c("V1" = "ensembl_gene_id")) %>% as_tibble() %>% rename(geneID = V1, seq = `3utr`) %>% filter(seq != "Sequence unavailable", length > 6) %>% select(-length) %>% mutate(sepseq = strsplit(tolower(seq), "")) %>% select(geneID, sepseq)
+apical_ctrl_seq <- left_join(apical_ctrl_gene, longest_3utr_Seq, by = c("V1" = "ensembl_gene_id")) %>% as_tibble() %>% rename(geneID = V1, seq = `3utr`) %>% filter(seq != "Sequence unavailable", length > 6) %>% select(-length) %>% mutate(sepseq = strsplit(tolower(seq), "")) %>% select(geneID, sepseq)
+basal_seq <- left_join(basal_gene, longest_3utr_Seq, by = c("V1" = "ensembl_gene_id")) %>% as_tibble() %>% rename(geneID = V1, seq = `3utr`) %>% filter(seq != "Sequence unavailable", length > 6) %>% select(-length) %>% mutate(sepseq = strsplit(tolower(seq), "")) %>% select(geneID, sepseq)
+basal_ctrl_seq <- left_join(basal_ctrl_gene, longest_3utr_Seq, by = c("V1" = "ensembl_gene_id")) %>% as_tibble() %>% rename(geneID = V1, seq = `3utr`) %>% filter(seq != "Sequence unavailable", length > 6) %>% select(-length) %>% mutate(sepseq = strsplit(tolower(seq), "")) %>% select(geneID, sepseq)
+
+```
+
+```{r, kcount}
+fisher <- function(a,b, c, d){
+  mat <- matrix(c(a, b, c, d), nr = 2)
+  fisher.test(mat, alternative = "two.sided")$p.value
+}
+
+a_kmer <- kcount(pull(apical_seq, sepseq), k = 6) %>% colSums() %>% as_tibble() %>% rownames_to_column() %>% rename(apical = value)
+ 
+a_ctrl_kmer <- kcount(pull(apical_ctrl_seq, sepseq), k = 6) %>% colSums() %>% as_tibble() %>% rownames_to_column() %>% rename(ctrl = value)
+
+a_kmer_stats <- left_join(a_ctrl_kmer, a_kmer) %>%  mutate(ctrl_freq = ctrl / sum(ctrl), apical_freq = apical / sum(apical)) %>% mutate(log2FC = log2(apical_freq/ctrl_freq)) %>% mutate(c_tot = sum(ctrl)-ctrl, a_tot = sum(apical)-apical) %>% rowwise() %>% mutate(pval = fisher(apical, ctrl, a_tot, c_tot)) %>% ungroup() %>% mutate(p_adj = p.adjust(pval, method = "BH")) %>% select(rowname, ctrl_freq, apical_freq, log2FC, pval, p_adj) 
+
+saveRDS(a_kmer_stats, file = "apical_kmer_stats_by_R.txt")
+
+b_kmer <- kcount(pull(basal_seq, sepseq), k = 6) %>% colSums() %>% as_tibble() %>% rownames_to_column() %>% rename(basal = value)
+ 
+b_ctrl_kmer <- kcount(pull(basal_ctrl_seq, sepseq), k = 6) %>% colSums() %>% as_tibble() %>% rownames_to_column() %>% rename(ctrl = value)
+
+b_kmer_stats <- left_join(b_ctrl_kmer, b_kmer) %>%  mutate(ctrl_freq = ctrl / sum(ctrl), basal_freq = basal / sum(basal)) %>% mutate(log2FC = log2(basal_freq/ctrl_freq)) %>% mutate(c_tot = sum(ctrl)-ctrl, b_tot = sum(basal)-basal) %>% rowwise() %>% mutate(pval = fisher(basal, ctrl, b_tot, c_tot)) %>% ungroup() %>% mutate(p_adj = p.adjust(pval, method = "BH")) %>% select(rowname, ctrl_freq, basal_freq, log2FC, pval, p_adj) 
+saveRDS(b_kmer_stats, file = "basal_kmer_stats_by_R.txt")
+
+```
+
+```{r, plots with r data}
+a <- a_kmer_stats %>% mutate(sig = ifelse(p_adj < 0.05, "sig", ""))
+a %>% ggplot(aes(x = log2FC, y = -log(p_adj), alpha = sig, col = sig)) + geom_point() + scale_color_manual(values = c("Black", "Red")) + scale_alpha_manual(values = c(0.01, 1)) + geom_text(data = subset(a, sig == "sig"), aes(label = rowname), nudge_y = 1)
+
+b <- b_kmer_stats %>% mutate(sig = ifelse(p_adj < 0.05, "sig", ""), top5 = ifelse(rowname %in% (top_n(., n = -5, wt = p_adj)$rowname), "top", ""))
+b %>% ggplot(aes(x = log2FC, y = -log(p_adj), alpha = sig, col = sig)) + geom_point() + scale_color_manual(values = c("Black", "Red")) + scale_alpha_manual(values = c(0.01, 1)) + geom_text(data = subset(b, top5 == "top"), aes(label = rowname), position = position_jitter(width = 0.25, height = 1))
+
+```
+
+```{r, get python data}
+apical_kmer <- read.table("apical_3pUTR_kmer.txt", header = TRUE)
+apical_kmer <- apical_kmer %>% as_tibble() %>% mutate(sig = ifelse(uncorrected_pvalue < 0.05, "sig", ""))
+
+#apical_kmer <- apical_kmer %>% as_tibble() %>% mutate(sig = ifelse(abs(enrichment_log2) > 2, "sig", ""))
+#apical_kmer <- apical_kmer %>% as_tibble() %>% mutate(sig = ifelse(uncorrected_pvalue < 0.05, ifelse(abs(enrichment_log2) > 2 , "sig", "")))
+```
+
+```{r, plot}
+apical_kmer %>% ggplot(aes(x = enrichment_log2, y = corrected_pvalue, col = sig)) + geom_point()
+apical_kmer %>% ggplot(aes(x = enrichment_log2, y = corrected_pvalue, alpha = sig, col = sig)) + geom_point() + scale_color_manual(values = c("Black", "Red")) + scale_alpha_manual(values = c(0.01, 1))
+```
