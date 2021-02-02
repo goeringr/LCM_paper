@@ -1,0 +1,182 @@
+---
+title: "LCM starv and refed"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tximport)
+library(biomaRt)
+library(stringr)
+library(ggfortify)
+library(DESeq2)
+library(pheatmap)
+library(ggpubr)
+library(tidyverse)
+library(cowplot)
+
+```
+
+```{r, tximport stuff}
+
+mart <- useMart("ENSEMBL_MART_ENSEMBL",
+                dataset = "mmusculus_gene_ensembl",
+                host= "www.ensembl.org")
+
+t2g <- getBM(attributes = c("ensembl_transcript_id",
+                            "ensembl_gene_id",
+                            "external_gene_name",
+                            "refseq_mrna"), mart = mart)
+
+t2g <- rename(t2g, target_id = ensembl_transcript_id, 
+              ext_gene = external_gene_name)
+
+ens2gene <- t2g[,c(2,3)]
+colnames(ens2gene)[2] <- "Gene"
+ens2gene <- unique(ens2gene)
+
+
+
+files <- list.files() %>% grep(pattern = "_filtered.quant.sf",value = TRUE) 
+samples <- str_sub(files, 1, str_length(files)-18)
+
+salm_dirs <- sapply(samples, function(id) file.path(paste(id,"_filtered.quant.sf",sep = "")))
+tx2gene <- t2g[,c(1,2)]
+colnames(tx2gene) <- c('TXNAME', 'GENEID')
+
+txi <- tximport(salm_dirs, 
+                type = 'salmon', 
+                tx2gene = tx2gene,
+                dropInfReps = TRUE, 
+                countsFromAbundance = 'lengthScaledTPM')
+
+tpms <- data.frame(txi$abundance) 
+tpms <- tpms[apply(tpms, MARGIN = 1, function(x) any(x > 10)), ] 
+
+saveRDS(tpms, file = "LCM_apical_basal_starv_refed_tpms_filtered.txt")
+```
+
+```{r,  tpm plots}
+dat <- t(tpms) %>% 
+  as_tibble() %>% 
+  mutate(sample = colnames(tpms),
+         region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"),
+         condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved")) %>% 
+  unite(region,condition,sep = "_", col = "condition") %>% 
+  select(sample, condition, everything())
+
+
+autoplot(prcomp(log(dat[3:ncol(dat)]+1)), 
+         data = dat,
+         colour = "condition",
+         size = 4) +
+  ggtitle("PCA of log(TPMs)") +
+  theme_cowplot()
+
+```
+
+```{r,  norm count plots}
+conditions <- c("ApicalRefed", "ApicalRefed", "ApicalRefed", "ApicalRefed", "ApicalRefed", "Apical", "Apical", "Apical", "Apical", "Apical", "BasalRefed", "BasalRefed", "BasalRefed", "BasalRefed", "BasalRefed", "Basal", "Basal", "Basal", "Basal", "Basal")
+type <- c("paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end", "paired-end")
+colData <- data.frame("sample" = samples, "Conditions" = conditions, "Type" = type)
+
+dds <- DESeqDataSetFromTximport(txi, colData = colData, design = ~Conditions)
+
+dds <- dds[rowMins(counts(dds)) > 10, ]
+
+dds <- DESeq(dds)
+
+norm_counts <- counts(dds,normalized = TRUE)
+norm_counts <- norm_counts[apply(norm_counts, MARGIN = 1, function(x) any(x > 100)), ]
+
+saveRDS(norm_counts, file = "LCM_apical_basal_starv_refed_norm_counts_filtered.txt")
+
+norm_counts_PCAdat <- t(norm_counts) %>%
+  as_tibble() %>%
+  mutate(sample = colnames(norm_counts),
+         region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"),
+         condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved")) %>%
+  unite(region,condition, sep = "_", col = "condition") %>% 
+  select(condition, everything(), -sample)
+
+autoplot(prcomp(log(norm_counts_PCAdat[2:ncol(norm_counts_PCAdat)]+1)),
+         data = norm_counts_PCAdat,
+         colour = "condition",
+         size = 4) +
+  ggtitle("PCA of log(normalized counts)") +
+  theme_cowplot()
+
+
+
+temp <- norm_counts
+annoDF <- colnames(temp) %>% as_tibble() %>%  mutate(region = ifelse(grepl(pattern = "Apical", x = value), "Apical", "Basal")) %>% select(region) %>% as.data.frame()
+rownames(annoDF) <- colnames(temp)
+cor_mat <- temp %>% cor(method = "spearman")
+pheatmap(cor_mat, annotation_col = annoDF)
+
+```
+
+```{r, }
+comparisons <- list(c("Apical_Refed", "Apical_Starved"), c("Basal_Refed", "Basal_Starved"), c("Apical_Refed", "Basal_Refed"),c("Apical_Starved", "Basal_Starved"))
+
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved")) %>% unite(region,condition,sep = "_", col = "group") %>% ggplot(aes(x = group, y = log(norm_counts), fill = group)) + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = comparisons, test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "All Genes")
+
+RP_genes_mm <- readRDS("C:/Users/rgoer/Documents/ABHaLo12.19/quants/mm_RPgenes.txt")
+
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved")) %>% unite(region,condition,sep = "_", col = "group") %>% ggplot(aes(x = group, y = log(as.numeric(norm_counts)), fill = group)) + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = comparisons, test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RP Genes")
+
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% filter(Gene == "Rpl7") %>% gather(-ensembl_gene_id, - Gene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved")) %>% unite(region,condition,sep = "_", col = "group") %>% ggplot(aes(x = group, y = log(norm_counts), fill = group)) + geom_violin() + geom_boxplot() + geom_point(position = "jitter") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RPL7")
+
+
+```
+
+```{r, }
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RP Genes") + facet_grid(.~RPgene) + geom_hline(yintercept = 0)
+
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(Gene == "Rpl7") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RPL7") + geom_hline(yintercept = 0) + scale_fill_manual(values = c("#808080", "#e8c040"))
+
+norm_counts %>% as_tibble(rownames = "ensembl_gene_id") %>% left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(Gene == "Rps28") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RPS28") + geom_hline(yintercept = 0) + scale_fill_manual(values = c("#808080", "#b82080"))
+
+#Rpl3 = "ENSMUSG00000060036"
+#Rpl4 = "ENSMUSG00000032399"
+```
+
+```{r, }
+tpms %>% as_tibble(rownames = "ensembl_gene_id") %>%  left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(ensembl_gene_id == "ENSMUSG00000060036") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "Rpl3") + geom_hline(yintercept = 0) 
+
+tpms %>% as_tibble(rownames = "ensembl_gene_id") %>%  left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(ensembl_gene_id == "ENSMUSG00000032399") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "Rpl4") + geom_hline(yintercept = 0) 
+
+tpms %>% as_tibble(rownames = "ensembl_gene_id") %>%  left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(Gene == "Rpl7") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "Rpl7") + geom_hline(yintercept = 0) 
+
+tpms %>% as_tibble(rownames = "ensembl_gene_id") %>%  left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% filter(Gene == "Rps28") %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test") + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "Rps28") + geom_hline(yintercept = 0) 
+
+tpms %>% as_tibble(rownames = "ensembl_gene_id") %>%  left_join(ens2gene) %>% mutate(RPgene = ifelse(ensembl_gene_id %in% RP_genes_mm, "yes", "no")) %>% gather(-ensembl_gene_id, -Gene, -RPgene, key = sample, value = norm_counts) %>% mutate(region = ifelse(grepl(pattern = "Apical", x = sample), "Apical", "Basal"), condition = ifelse(grepl(pattern = "refed", x = sample), "Refed", "Starved"), rep = substr(sample, nchar(sample), nchar(sample))) %>% select(-sample) %>% rowwise() %>% spread(region, norm_counts) %>% mutate(ApicalBias = log2(as.numeric(Apical)/as.numeric(Basal))) %>% ggplot(aes(x = condition, y = ApicalBias, fill = condition))  + geom_violin() + geom_boxplot() + stat_compare_means(comparisons = list(c("Refed", "Starved")), test = "Wilcox.test", label.y = 4) + theme_cowplot() + guides(fill = FALSE) + labs(x = "", title = "RP genes") + geom_hline(yintercept = 0) + facet_grid(.~RPgene) + coord_cartesian(ylim = c(-5,5))
+
+```
+
+```{r, }
+library(ggmsa)
+library(Biostrings)
+library(msa)
+
+RPL7 = "cctctttttccggctggaacc"
+Rpl7 = "tttaaggagacagtgcgcatgcgccacctttctctcttcttttccggctggaacc"
+RPS28 = "actcctctccgccagaccgccgccgcgccgccatc"
+Rps28 = "ctcgcgagagcgaaagtgaggcgtggtcagagccgactataaaaggcatcccctgctcacgtgactcctctccgccagatcgccgccatc"
+
+RPL7_Seq <- c(DNAStringSet(RPL7), DNAStringSet(Rpl7))
+RPS28_Seq <- c(DNAStringSet(RPS28), DNAStringSet(Rps28))
+
+names(RPL7_Seq) <- c("RPL7", "Rpl7")
+names(RPS28_Seq) <- c("RPS28", "Rps28")
+
+RPL7_align <- msa(RPL7_Seq) %>% DNAStringSet()
+RPS28_align <- msa(RPS28_Seq) %>% DNAStringSet()
+
+
+ggmsa(RPL7_align, start = 35, end = 55, color = "Chemistry_NT", seq_name = TRUE)
+ggmsa(RPS28_align, start = 64, end = 90, color = "Chemistry_NT", seq_name = TRUE)
+
+```
+
